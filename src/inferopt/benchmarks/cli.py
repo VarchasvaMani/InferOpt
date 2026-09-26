@@ -1,0 +1,1250 @@
+"""Command-line interface for running reproducible InferOpt benchmarks."""
+
+import argparse
+import asyncio
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from inferopt.backends.mock import MockBackend
+from inferopt.benchmarks.generator import PRESET_SCENARIOS, generate_workload
+from inferopt.benchmarks.models import WorkloadConfig
+from inferopt.benchmarks.runner import BenchmarkRunner
+from inferopt.scheduler.config import BatchConfig, SchedulerConfig
+
+if TYPE_CHECKING:
+    from inferopt.backends.base import InferenceBackend
+
+
+class _ConcurrencyAction(argparse.Action):
+    """Parse concurrency as a single int if 1 value, or list of ints if multiple."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        if isinstance(values, (list, tuple)):
+            int_vals = [int(v) for v in values]
+            if len(int_vals) == 1:
+                setattr(namespace, self.dest, int_vals[0])
+            else:
+                setattr(namespace, self.dest, int_vals)
+        elif isinstance(values, (str, int)):
+            setattr(namespace, self.dest, int(values))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build command line argument parser for the benchmark harness."""
+    parser = argparse.ArgumentParser(
+        prog="inferopt-bench",
+        description="InferOpt Benchmarking Harness - Run controlled inference serving benchmarks",
+    )
+    parser.add_argument(
+        "--scenario",
+        "-s",
+        choices=list(PRESET_SCENARIOS.keys()),
+        default="light",
+        help="Pre-configured workload scenario to execute (default: light).",
+    )
+    parser.add_argument(
+        "--num-requests",
+        "-n",
+        type=int,
+        default=None,
+        help="Override total request count in scenario.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible workload generation (default: 42).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        "-c",
+        nargs="+",
+        action=_ConcurrencyAction,
+        default=None,
+        help="Scheduler max_concurrency override (or list of concurrencies for audit).",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="List of maximum batch sizes to evaluate in audit or matrix (e.g. 1 2 4 8).",
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        "-b",
+        type=int,
+        default=None,
+        help="Scheduler batch_config.max_batch_size override.",
+    )
+    parser.add_argument(
+        "--batch-wait-ms",
+        "-w",
+        type=float,
+        default=None,
+        help="Scheduler batch_config.batch_wait_ms override.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["mock", "mlx", "vllm"],
+        default=None,
+        help="Inference backend implementation to evaluate "
+        "(default: vllm for Step 10-13, mock otherwise).",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model identifier (defaults: mlx-community/Qwen2.5-0.5B-Instruct-4bit for MLX, "
+        "Qwen/Qwen2.5-0.5B-Instruct for vLLM).",
+    )
+    parser.add_argument(
+        "--validate-mlx",
+        action="store_true",
+        help="Run Step 8.5 controlled Direct MLX vs InferOpt validation experiment.",
+    )
+    parser.add_argument(
+        "--validate-vllm",
+        action="store_true",
+        help="Run Step 10 controlled Direct vLLM vs InferOpt scientific benchmark experiment.",
+    )
+    parser.add_argument(
+        "--experiment-step11",
+        action="store_true",
+        help="Run Step 11 Workload-Aware Batch Configuration Selection Experiment.",
+    )
+    parser.add_argument(
+        "--experiment-step12",
+        action="store_true",
+        help="Run Step 12 Multi-Workload Generalization Experiment.",
+    )
+    parser.add_argument(
+        "--experiment-step13",
+        action="store_true",
+        help="Run Step 13 Online Adaptive Control & Dynamic Reconfiguration Experiment.",
+    )
+    parser.add_argument(
+        "--experiment-step14",
+        action="store_true",
+        help="Run Step 14 SLA-Aware Online Adaptive Control "
+        "& Dynamic Pareto Latency Guardrailing Experiment.",
+    )
+    parser.add_argument(
+        "--experiment-step15",
+        action="store_true",
+        help="Run Step 15 Multi-Model Generalization & Cross-Model Optimization Experiment.",
+    )
+    parser.add_argument(
+        "--experiment-step16",
+        action="store_true",
+        help="Run Step 16 Heavy-Load Scalability & Saturation Characterization Experiment.",
+    )
+    parser.add_argument(
+        "--experiment-step17",
+        action="store_true",
+        help="Run Step 17 Long-Context & Production-Like Traffic Validation Experiment.",
+    )
+    parser.add_argument(
+        "--context-profiles",
+        nargs="+",
+        default=None,
+        help="Context profiles to evaluate in Step 17 (e.g. SHORT MEDIUM LONG XLONG).",
+    )
+    parser.add_argument(
+        "--traffic-profiles",
+        nargs="+",
+        default=None,
+        help="Traffic patterns for Step 17 (e.g. STEADY BURSTY MIXED LONG_CONTEXT_BURST).",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        help=(
+            "List of model IDs to evaluate in Step 15 multi-model benchmark "
+            "(e.g. Qwen/Qwen2.5-0.5B-Instruct meta-llama/Llama-3.2-1B-Instruct)."
+        ),
+    )
+    parser.add_argument(
+        "--loads",
+        nargs="+",
+        type=int,
+        default=None,
+        help="List of offered request load levels for Step 16/17 (e.g. 16 32 64).",
+    )
+    parser.add_argument(
+        "--target-slo-p95-ms",
+        type=float,
+        default=180.0,
+        help="Target p95 total latency SLO in milliseconds for Step 14/15/16/17.",
+    )
+    parser.add_argument(
+        "--phase-sequence",
+        nargs="+",
+        default=None,
+        help="Phase sequence for Step 13 (e.g. light bursty saturated light).",
+    )
+    parser.add_argument(
+        "--num-requests-per-phase",
+        type=int,
+        default=16,
+        help="Number of requests per phase in Step 13/14 (default: 16).",
+    )
+    parser.add_argument(
+        "--workloads",
+        nargs="+",
+        help=(
+            "Filter workload classes to evaluate in Step 12 "
+            "(e.g. A_LIGHT B_BURSTY C_SATURATED D_MIXED)."
+        ),
+    )
+    parser.add_argument(
+        "--val-repetitions",
+        type=int,
+        default=None,
+        help="Measured repetition trials for independent validation in Step 11/12 (default: 3).",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        default=False,
+        help="Enforce eager execution mode in vLLM engine (disables CUDA graphs, diagnostic mode).",
+    )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Run complete 6-condition scientific MLX audit across concurrency and batch levels.",
+    )
+    parser.add_argument(
+        "--batch-matrix",
+        action="store_true",
+        help="Run batching experiment matrix (concurrency 4,8,16 x batch 1,2,4,8).",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="Warmup requests before timing (default: 2 for vLLM/step11/step16/17, 1 otherwise).",
+    )
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=None,
+        help="Measured repetition trials (default: 3 for vLLM/step11, 5 for audit, 3 otherwise).",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="File path to save the JSON benchmark result.",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable detailed benchmark output.",
+    )
+    return parser
+
+
+async def run_benchmark_cli(args: argparse.Namespace) -> int:
+    """Execute benchmark run with arguments parsed from CLI."""
+    # Step 17: Long-Context & Production-Like Traffic Validation Experiment
+    if args.experiment_step17:
+        from inferopt.benchmarks.step17_long_context import (
+            DEFAULT_STEP17_LOAD_LEVELS,
+            DEFAULT_STEP17_MODEL_ID,
+            DEFAULT_STEP17_TARGET_P95_MS,
+            ContextProfile,
+            Step17BenchmarkRunner,
+            TrafficProfile,
+            format_step17_report,
+        )
+        from inferopt.optimizer.sla_models import TargetSLO
+
+        model_id = args.model if args.model is not None else DEFAULT_STEP17_MODEL_ID
+        loads = tuple(args.loads) if args.loads is not None else DEFAULT_STEP17_LOAD_LEVELS
+        # For Step 17, default target SLO is 5000.0ms unless explicitly overridden
+        target_p95 = (
+            args.target_slo_p95_ms
+            if args.target_slo_p95_ms != 180.0
+            else DEFAULT_STEP17_TARGET_P95_MS
+        )
+        repetitions = args.repetitions if args.repetitions is not None else 1
+        warmup = args.warmup if args.warmup is not None else 2
+        out_dir = args.output if args.output is not None else "benchmarks/results/step17"
+
+        ctx_profs: list[ContextProfile] = []
+        if args.context_profiles:
+            for cp_str in args.context_profiles:
+                try:
+                    ctx_profs.append(ContextProfile(cp_str.upper()))
+                except ValueError:
+                    print(f"Warning: Unknown context profile '{cp_str}', ignoring.")
+        if not ctx_profs:
+            ctx_profs = [
+                ContextProfile.SHORT,
+                ContextProfile.MEDIUM,
+                ContextProfile.LONG,
+                ContextProfile.XLONG,
+            ]
+
+        traf_profs: list[TrafficProfile] = []
+        if args.traffic_profiles:
+            for tp_str in args.traffic_profiles:
+                try:
+                    traf_profs.append(TrafficProfile(tp_str.upper()))
+                except ValueError:
+                    print(f"Warning: Unknown traffic profile '{tp_str}', ignoring.")
+        if not traf_profs:
+            traf_profs = [
+                TrafficProfile.STEADY,
+                TrafficProfile.BURSTY,
+                TrafficProfile.MIXED,
+                TrafficProfile.LONG_CONTEXT_BURST,
+            ]
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT STEP 17 LONG-CONTEXT & PRODUCTION TRAFFIC EXPERIMENT")
+        print("=" * 80)
+        print(f"  Model ID:            {model_id}")
+        print(f"  Context Profiles:    {[c.value for c in ctx_profs]}")
+        print(f"  Traffic Profiles:    {[t.value for t in traf_profs]}")
+        print(f"  Load Levels:         {list(loads)}")
+        print(f"  Target SLO (p95):    {target_p95:.1f} ms")
+        print(f"  Repetitions:         {repetitions}")
+        print(f"  Warmup:              {warmup}")
+        print(f"  Seed:                {args.seed}")
+        print(f"  Backend:             {args.backend or 'vllm'}")
+        print(f"  Enforce Eager:       {args.enforce_eager}")
+        print(f"  Output Directory:    {out_dir}")
+        print("=" * 80 + "\n")
+
+        step17_backend_type = args.backend or "vllm"
+        step17_target_slo = TargetSLO(p95_latency_ms=target_p95)
+        runner_step17 = Step17BenchmarkRunner(
+            model_id=model_id,
+            context_profiles=ctx_profs,
+            traffic_profiles=traf_profs,
+            load_levels=loads,
+            target_slo=step17_target_slo,
+            enforce_eager=args.enforce_eager,
+        )
+
+        step17_mock_backend: Any = None
+        if step17_backend_type == "mock":
+            step17_mock_backend = MockBackend(default_latency_sec=0.005)
+
+        report_step17 = await runner_step17.run_experiment(
+            backend=step17_mock_backend,
+            repetitions=repetitions,
+            warmup_count=warmup,
+            seed=args.seed,
+        )
+
+        print()
+        print(format_step17_report(report_step17))
+        if out_dir:
+            summary_path, raw_path, context_path, traffic_path, readme_path = (
+                runner_step17.save_reports(report_step17, Path(out_dir))
+            )
+            print(f"\nSaved structured Step 17 reports to: {out_dir}")
+            print(f"  - Summary:          {summary_path}")
+            print(f"  - Raw Data:         {raw_path}")
+            print(f"  - Context Analysis: {context_path}")
+            print(f"  - Traffic Analysis: {traffic_path}")
+            print(f"  - README:           {readme_path}")
+
+        all_passed = all(
+            cond.all_repetitions_valid
+            for cell_res in report_step17.results_by_cell.values()
+            for cond in cell_res.conditions.values()
+        )
+        return 0 if all_passed else 1
+
+    # Step 16: Heavy-Load Scalability & Saturation Characterization Experiment
+    if args.experiment_step16:
+        from inferopt.benchmarks.step16_scalability import (
+            DEFAULT_STEP16_LOAD_LEVELS,
+            DEFAULT_STEP16_MODEL_ID,
+            Step16ScalabilityRunner,
+            format_step16_report,
+        )
+        from inferopt.optimizer.sla_models import TargetSLO
+
+        model_id = args.model if args.model is not None else DEFAULT_STEP16_MODEL_ID
+        loads = tuple(args.loads) if args.loads is not None else DEFAULT_STEP16_LOAD_LEVELS
+        target_p95 = args.target_slo_p95_ms if args.target_slo_p95_ms is not None else 180.0
+        repetitions = args.repetitions if args.repetitions is not None else 1
+        warmup = args.warmup if args.warmup is not None else 2
+        out_dir = args.output if args.output is not None else "benchmarks/results/step16"
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT STEP 16 HEAVY-LOAD SCALABILITY EXPERIMENT")
+        print("=" * 80)
+        print(f"  Model ID:            {model_id}")
+        print(f"  Load Levels:         {list(loads)}")
+        print(f"  Target SLO (p95):    {target_p95:.1f} ms")
+        print(f"  Repetitions:         {repetitions}")
+        print(f"  Warmup:              {warmup}")
+        print(f"  Seed:                {args.seed}")
+        print(f"  Backend:             {args.backend or 'vllm'}")
+        print(f"  Enforce Eager:       {args.enforce_eager}")
+        print(f"  Output Directory:    {out_dir}")
+        print("=" * 80 + "\n")
+
+        step16_backend_type = args.backend or "vllm"
+        step16_target_slo = TargetSLO(p95_latency_ms=target_p95)
+        runner_step16 = Step16ScalabilityRunner(
+            model_id=model_id,
+            load_levels=loads,
+            target_slo=step16_target_slo,
+            enforce_eager=args.enforce_eager,
+        )
+
+        step16_mock_backend: Any = None
+        if step16_backend_type == "mock":
+            step16_mock_backend = MockBackend(default_latency_sec=0.005)
+
+        report_step16 = await runner_step16.run_experiment(
+            backend=step16_mock_backend,
+            repetitions=repetitions,
+            warmup_count=warmup,
+            seed=args.seed,
+        )
+
+        print()
+        print(format_step16_report(report_step16))
+        if out_dir:
+            summary_path, raw_path, analysis_path = runner_step16.save_reports(
+                report_step16, Path(out_dir)
+            )
+            print(f"\nSaved structured Step 16 reports to: {out_dir}")
+            print(f"  - Summary:   {summary_path}")
+            print(f"  - Raw Data:  {raw_path}")
+            print(f"  - Analysis:  {analysis_path}")
+
+        all_passed = all(
+            cond.all_repetitions_valid
+            for load_res in report_step16.results_by_load.values()
+            for cond in load_res.conditions.values()
+        )
+        return 0 if all_passed else 1
+
+    # Step 15: Multi-Model Generalization & Cross-Model Optimization Experiment
+    if args.experiment_step15:
+        from inferopt.benchmarks.step15_multi_model import (
+            DEFAULT_STEP15_MODELS,
+            ModelSpec,
+            Step15MultiModelRunner,
+            format_step15_report,
+        )
+        from inferopt.optimizer.sla_models import TargetSLO
+
+        models: tuple[ModelSpec, ...]
+        if args.models:
+            custom_models = []
+            for m_str in args.models:
+                lower_m = m_str.lower()
+                fam = (
+                    "qwen2.5"
+                    if "qwen" in lower_m
+                    else (
+                        "smollm2"
+                        if "smollm" in lower_m
+                        else ("llama3.2" if "llama" in lower_m else "unknown")
+                    )
+                )
+                size = (
+                    "0.5B"
+                    if "0.5b" in lower_m
+                    else (
+                        "1.5B"
+                        if "1.5b" in lower_m
+                        else (
+                            "1.7B" if "1.7b" in lower_m else ("1B" if "1b" in lower_m else "custom")
+                        )
+                    )
+                )
+                custom_models.append(
+                    ModelSpec(
+                        model_id=m_str,
+                        model_family=fam,
+                        parameter_size_label=size,
+                    )
+                )
+            models = tuple(custom_models)
+        elif args.model:
+            lower_m = args.model.lower()
+            fam = (
+                "qwen2.5"
+                if "qwen" in lower_m
+                else (
+                    "smollm2"
+                    if "smollm" in lower_m
+                    else ("llama3.2" if "llama" in lower_m else "unknown")
+                )
+            )
+            size = (
+                "0.5B"
+                if "0.5b" in lower_m
+                else (
+                    "1.5B"
+                    if "1.5b" in lower_m
+                    else ("1.7B" if "1.7b" in lower_m else ("1B" if "1b" in lower_m else "custom"))
+                )
+            )
+            models = (
+                ModelSpec(
+                    model_id=args.model,
+                    model_family=fam,
+                    parameter_size_label=size,
+                ),
+            )
+        else:
+            models = DEFAULT_STEP15_MODELS
+
+        num_reqs = args.num_requests_per_phase if args.num_requests_per_phase is not None else 8
+        target_p95 = args.target_slo_p95_ms if args.target_slo_p95_ms is not None else 180.0
+        out_dir = args.output if args.output is not None else "benchmarks/results/step15"
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT STEP 15 MULTI-MODEL GENERALIZATION EXPERIMENT")
+        print("=" * 80)
+        print(f"  Target Models:       {[m.model_id for m in models]}")
+        print(f"  Target SLO (p95):    {target_p95:.1f} ms")
+        print(f"  Requests Per Phase:  {num_reqs}")
+        print(f"  Seed:                {args.seed}")
+        print(f"  Backend:             {args.backend or 'vllm'}")
+        print(f"  Enforce Eager:       {args.enforce_eager}")
+        print(f"  Output Directory:    {out_dir}")
+        print("=" * 80 + "\n")
+
+        backend_type = args.backend or "vllm"
+        target_slo = TargetSLO(p95_latency_ms=target_p95)
+        runner_step15 = Step15MultiModelRunner(
+            models=models,
+            target_slo=target_slo,
+            enforce_eager=args.enforce_eager,
+        )
+
+        mock_backend: Any = None
+        if backend_type == "mock":
+            mock_backend = MockBackend(default_latency_sec=0.005)
+
+        report_step15 = await runner_step15.run_cross_model_benchmark(
+            backend_type=backend_type,
+            backend_override=mock_backend,
+            requests_per_phase=num_reqs,
+            seed=args.seed,
+        )
+
+        print()
+        print(format_step15_report(report_step15))
+        if out_dir:
+            summary_path, raw_path, analysis_path = runner_step15.save_reports(
+                report_step15, Path(out_dir)
+            )
+            print(f"\nSaved structured Step 15 reports to: {out_dir}")
+            print(f"  - Summary:   {summary_path}")
+            print(f"  - Raw Data:  {raw_path}")
+            print(f"  - Analysis:  {analysis_path}")
+
+        successful_runs = [r for r in report_step15.results_by_model.values() if r.is_successful]
+        if not successful_runs:
+            return 1
+        all_passed = all(
+            cond.integrity_valid for r in successful_runs for cond in r.conditions.values()
+        )
+        return 0 if all_passed else 1
+
+    # Step 14: SLA-Aware Online Adaptive Control & Dynamic Pareto Latency Guardrailing Experiment
+    if args.experiment_step14:
+        from inferopt.backends.vllm import DEFAULT_VLLM_MODEL_ID, VLLMBackend, VLLMConfig
+        from inferopt.benchmarks.step14_sla_adaptive import (
+            Step14SLAExperimentRunner,
+            format_step14_report,
+        )
+        from inferopt.optimizer.sla_models import TargetSLO
+
+        model_id = args.model if args.model is not None else DEFAULT_VLLM_MODEL_ID
+        num_reqs = args.num_requests_per_phase if args.num_requests_per_phase is not None else 16
+        target_p95 = args.target_slo_p95_ms if args.target_slo_p95_ms is not None else 180.0
+        out_path = (
+            args.output
+            if args.output is not None
+            else "benchmarks/results/step14/step14_sla_adaptive_report.json"
+        )
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT STEP 14 SLA-AWARE ONLINE ADAPTIVE CONTROL EXPERIMENT")
+        print("=" * 80)
+        print(f"  Model ID:            {model_id}")
+        print(f"  Target SLO (p95):    {target_p95:.1f} ms")
+        print(f"  Requests Per Phase:  {num_reqs}")
+        print(f"  Seed:                {args.seed}")
+        print(f"  Enforce Eager:       {args.enforce_eager}")
+        print(f"  Output Path:         {out_path}")
+        print("=" * 80 + "\n")
+
+        step14_backend_choice = args.backend if args.backend is not None else "vllm"
+
+        step14_backend_inst: InferenceBackend
+        if step14_backend_choice == "vllm":
+            step14_backend_inst = VLLMBackend(
+                config=VLLMConfig(
+                    model=model_id,
+                    enforce_eager=args.enforce_eager,
+                )
+            )
+        elif step14_backend_choice == "mlx":
+            from inferopt.backends.mlx import DEFAULT_MODEL_ID as DEFAULT_MLX_MODEL_ID
+            from inferopt.backends.mlx import MLXBackend
+
+            step14_backend_inst = MLXBackend(model_id=args.model or DEFAULT_MLX_MODEL_ID)
+        else:
+            step14_backend_inst = MockBackend(default_latency_sec=0.005)
+
+        target_slo = TargetSLO(p95_latency_ms=target_p95)
+        runner_step14 = Step14SLAExperimentRunner(
+            model_id=model_id,
+            target_slo=target_slo,
+        )
+
+        try:
+            if hasattr(step14_backend_inst, "load_model"):
+                await step14_backend_inst.load_model()
+
+            report_step14 = await runner_step14.run_experiment(
+                backend=step14_backend_inst,
+                num_requests_per_phase=num_reqs,
+                seed=args.seed,
+            )
+        finally:
+            if hasattr(step14_backend_inst, "unload_model"):
+                await step14_backend_inst.unload_model()
+
+        # Update teardown count to accurately reflect completed lifecycle after unload
+        final_teardowns_14 = getattr(
+            step14_backend_inst, "engine_teardowns", report_step14.engine_teardown_count
+        )
+        report_step14 = report_step14.model_copy(
+            update={"engine_teardown_count": final_teardowns_14}
+        )
+
+        print()
+        print(format_step14_report(report_step14))
+        if out_path:
+            runner_step14.save_report(report_step14, Path(out_path).parent)
+            print(f"\nSaved structured Step 14 SLA adaptive control JSON report to: {out_path}")
+
+        step14_summary = report_step14.conditions.get("SLA_AWARE_ADAPTIVE")
+        return 0 if (step14_summary is not None and step14_summary.integrity_valid) else 1
+
+    # Step 13: Online Adaptive Control & Dynamic Reconfiguration Experiment
+    if args.experiment_step13:
+        from inferopt.backends.vllm import DEFAULT_VLLM_MODEL_ID, VLLMBackend, VLLMConfig
+        from inferopt.benchmarks.step13_adaptive import (
+            Step13AdaptiveExperimentRunner,
+            format_step13_report,
+        )
+
+        model_id = args.model if args.model is not None else DEFAULT_VLLM_MODEL_ID
+        num_reqs = args.num_requests_per_phase if args.num_requests_per_phase is not None else 16
+        out_path = (
+            args.output
+            if args.output is not None
+            else "benchmarks/results/step13/step13_adaptive_report.json"
+        )
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT STEP 13 ONLINE ADAPTIVE CONTROL EXPERIMENT")
+        print("=" * 80)
+        print(f"  Model ID:            {model_id}")
+        print(f"  Requests Per Phase:  {num_reqs}")
+        print(f"  Seed:                {args.seed}")
+        print(f"  Enforce Eager:       {args.enforce_eager}")
+        print(f"  Output Path:         {out_path}")
+        print("=" * 80 + "\n")
+
+        step13_backend_choice = args.backend if args.backend is not None else "vllm"
+
+        step13_backend_inst: InferenceBackend
+        if step13_backend_choice == "vllm":
+            step13_backend_inst = VLLMBackend(
+                config=VLLMConfig(
+                    model=model_id,
+                    enforce_eager=args.enforce_eager,
+                )
+            )
+        elif step13_backend_choice == "mlx":
+            from inferopt.backends.mlx import DEFAULT_MODEL_ID as DEFAULT_MLX_MODEL_ID
+            from inferopt.backends.mlx import MLXBackend
+
+            step13_backend_inst = MLXBackend(model_id=args.model or DEFAULT_MLX_MODEL_ID)
+        else:
+            step13_backend_inst = MockBackend(default_latency_sec=0.005)
+
+        runner_step13 = Step13AdaptiveExperimentRunner(
+            model_id=model_id,
+            enforce_eager=args.enforce_eager,
+        )
+
+        try:
+            if hasattr(step13_backend_inst, "load_model"):
+                await step13_backend_inst.load_model()
+
+            report_step13 = await runner_step13.run_experiment(
+                backend=step13_backend_inst,
+                num_requests_per_phase=num_reqs,
+                seed=args.seed,
+            )
+        finally:
+            if hasattr(step13_backend_inst, "unload_model"):
+                await step13_backend_inst.unload_model()
+
+        # Update teardown count to accurately reflect completed lifecycle after unload
+        final_teardowns_13 = getattr(
+            step13_backend_inst, "engine_teardowns", report_step13.engine_teardown_count
+        )
+        report_step13 = report_step13.model_copy(
+            update={"engine_teardown_count": final_teardowns_13}
+        )
+
+        print()
+        print(format_step13_report(report_step13))
+        if out_path:
+            report_step13.save_json(out_path)
+            print(f"\nSaved structured Step 13 online adaptive control JSON report to: {out_path}")
+
+        step13_summary = report_step13.conditions.get("ADAPTIVE_INFEROPT")
+        return 0 if (step13_summary is not None and step13_summary.integrity_valid) else 1
+
+    # Step 12: Multi-Workload Generalization Experiment
+    if args.experiment_step12:
+        from inferopt.backends.vllm import DEFAULT_VLLM_MODEL_ID
+        from inferopt.benchmarks.step12_generalization import (
+            Step12GeneralizationRunner,
+            format_step12_report,
+            get_step12_workload_matrix,
+        )
+        from inferopt.optimizer.models import CandidateSpace
+
+        model_id = args.model if args.model is not None else DEFAULT_VLLM_MODEL_ID
+
+        warmup_count = args.warmup if args.warmup is not None else 2
+        repetitions = args.repetitions if args.repetitions is not None else 3
+        val_repetitions = args.val_repetitions if args.val_repetitions is not None else 3
+
+        if args.concurrency is not None:
+            if isinstance(args.concurrency, list):
+                concurrencies = tuple(args.concurrency)
+            else:
+                concurrencies = (args.concurrency,)
+        else:
+            concurrencies = (1, 4, 8)
+
+        if args.batch_sizes is not None:
+            batch_sizes = tuple(args.batch_sizes)
+        elif args.max_batch_size is not None:
+            batch_sizes = (args.max_batch_size,)
+        else:
+            batch_sizes = (1, 2, 4, 8)
+
+        batch_wait_ms = args.batch_wait_ms if args.batch_wait_ms is not None else 50.0
+
+        space = CandidateSpace(
+            concurrencies=concurrencies,
+            batch_sizes=batch_sizes,
+            batch_waits_ms=(batch_wait_ms,),
+        )
+
+        out_dir = args.output if args.output is not None else "benchmarks/results/step12"
+
+        # Construct workload matrix
+        matrix = get_step12_workload_matrix(
+            seed=args.seed,
+            num_requests=args.num_requests,
+        )
+        if args.workloads:
+            selected_keys = set(args.workloads)
+            matrix = {k: v for k, v in matrix.items() if k in selected_keys}
+            if not matrix:
+                print(
+                    f"Error: No matching workloads found for {args.workloads}",
+                    file=sys.stderr,
+                )
+                return 1
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT STEP 12 MULTI-WORKLOAD GENERALIZATION EXPERIMENT")
+        print("=" * 80)
+        print(f"  Model ID:            {model_id}")
+        print(f"  Workloads in Matrix: {list(matrix.keys())}")
+        print(
+            f"  Candidate Space:     concurrency={concurrencies}, "
+            f"batch_sizes={batch_sizes}, wait={batch_wait_ms}ms"
+        )
+        print(f"  Total Candidates:    {space.total_candidates} per workload")
+        print(f"  Enforce Eager:       {args.enforce_eager}")
+        print(f"  Exploration Reps:    {repetitions} (Warmup: {warmup_count})")
+        print(f"  Validation Reps:     {val_repetitions}")
+        print(f"  Output Dir:          {out_dir}")
+        print("=" * 80 + "\n")
+
+        runner_step12 = Step12GeneralizationRunner(
+            model_id=model_id,
+            enforce_eager=args.enforce_eager,
+        )
+
+        report_step12 = await runner_step12.run_experiment(
+            workloads=matrix,
+            candidate_space=space,
+            warmup_count=warmup_count,
+            exploration_repetitions=repetitions,
+            validation_repetitions=val_repetitions,
+            batch_wait_ms=batch_wait_ms,
+            output_dir=out_dir,
+        )
+
+        print()
+        print(format_step12_report(report_step12))
+        print(f"\nSaved structured Step 12 generalization JSON report to: {out_dir}")
+        return 0 if report_step12.summary.total_integrity_failures == 0 else 1
+
+    # Step 11: Workload-Aware Batch Configuration Selection Experiment
+    if args.experiment_step11:
+        from inferopt.backends.vllm import DEFAULT_VLLM_MODEL_ID
+        from inferopt.benchmarks.step11_experiment import (
+            Step11ExperimentRunner,
+            format_step11_report,
+        )
+        from inferopt.optimizer.models import CandidateSpace
+
+        model_id = args.model if args.model is not None else DEFAULT_VLLM_MODEL_ID
+
+        scenario_name = args.scenario if args.scenario != "light" else "concurrent_4"
+        scenario_factory = PRESET_SCENARIOS.get(scenario_name, PRESET_SCENARIOS["concurrent_4"])
+        scenario = scenario_factory(args.seed)
+
+        if args.num_requests is not None and args.num_requests > 0:
+            cfg_dict = scenario.config.model_dump()
+            cfg_dict["num_requests"] = args.num_requests
+            scenario = generate_workload(WorkloadConfig.model_validate(cfg_dict))
+
+        warmup_count = args.warmup if args.warmup is not None else 2
+        repetitions = args.repetitions if args.repetitions is not None else 3
+        val_repetitions = args.val_repetitions if args.val_repetitions is not None else 3
+
+        if args.concurrency is not None:
+            if isinstance(args.concurrency, list):
+                concurrencies = tuple(args.concurrency)
+            else:
+                concurrencies = (args.concurrency,)
+        else:
+            concurrencies = (1, 4, 8)
+
+        if args.batch_sizes is not None:
+            batch_sizes = tuple(args.batch_sizes)
+        elif args.max_batch_size is not None:
+            batch_sizes = (args.max_batch_size,)
+        else:
+            batch_sizes = (1, 2, 4, 8)
+
+        batch_wait_ms = args.batch_wait_ms if args.batch_wait_ms is not None else 50.0
+
+        space = CandidateSpace(
+            concurrencies=concurrencies,
+            batch_sizes=batch_sizes,
+            batch_waits_ms=(batch_wait_ms,),
+        )
+
+        out_dir = args.output if args.output is not None else "benchmarks/results/step11"
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT STEP 11 EXPERIMENT 1: CONFIGURATION SELECTION")
+        print("=" * 80)
+        print(f"  Model ID:            {model_id}")
+        req_info = f"{len(scenario.requests)} requests, seed={args.seed}"
+        print(f"  Scenario:            {scenario.scenario_name} ({req_info})")
+        print(
+            f"  Candidate Space:     concurrency={concurrencies}, "
+            f"batch_sizes={batch_sizes}, wait={batch_wait_ms}ms"
+        )
+        print(f"  Total Candidates:    {space.total_candidates}")
+        print(f"  Enforce Eager:       {args.enforce_eager}")
+        print(f"  Exploration Reps:    {repetitions} (Warmup: {warmup_count})")
+        print(f"  Validation Reps:     {val_repetitions}")
+        print(f"  Output Dir:          {out_dir}")
+        print("=" * 80 + "\n")
+
+        runner_step11 = Step11ExperimentRunner(
+            model_id=model_id,
+            enforce_eager=args.enforce_eager,
+        )
+
+        report_step11 = await runner_step11.run_experiment(
+            scenario=scenario,
+            candidate_space=space,
+            warmup_count=warmup_count,
+            exploration_repetitions=repetitions,
+            validation_repetitions=val_repetitions,
+            batch_wait_ms=batch_wait_ms,
+            output_dir=out_dir,
+        )
+
+        print()
+        print(format_step11_report(report_step11))
+        print(f"\nSaved structured Step 11 experiment JSON report to: {out_dir}")
+        return 0 if report_step11.integrity.is_valid else 1
+
+    # Step 10: Controlled Scientific vLLM Benchmark Mode
+    if args.validate_vllm:
+        from inferopt.backends.vllm import DEFAULT_VLLM_MODEL_ID
+        from inferopt.benchmarks.vllm_validation import (
+            VLLMValidator,
+            format_vllm_full_report,
+        )
+
+        model_id = args.model if args.model is not None else DEFAULT_VLLM_MODEL_ID
+        validator = VLLMValidator(
+            model_id=model_id,
+            enforce_eager=args.enforce_eager,
+        )
+
+        scenario_name = args.scenario if args.scenario != "light" else "concurrent_4"
+        scenario_factory = PRESET_SCENARIOS.get(scenario_name, PRESET_SCENARIOS["concurrent_4"])
+        scenario = scenario_factory(args.seed)
+
+        if args.num_requests is not None and args.num_requests > 0:
+            cfg_dict = scenario.config.model_dump()
+            cfg_dict["num_requests"] = args.num_requests
+            scenario = generate_workload(WorkloadConfig.model_validate(cfg_dict))
+
+        warmup_count = args.warmup if args.warmup is not None else 2
+        repetitions = args.repetitions if args.repetitions is not None else 3
+
+        if args.concurrency is not None:
+            if isinstance(args.concurrency, list):
+                concurrencies = tuple(args.concurrency)
+            else:
+                concurrencies = (args.concurrency,)
+        else:
+            concurrencies = (1, 4, 8, 16)
+
+        if args.batch_sizes is not None:
+            batch_sizes = tuple(args.batch_sizes)
+        elif args.max_batch_size is not None:
+            batch_sizes = (args.max_batch_size,)
+        else:
+            batch_sizes = (1, 2, 4, 8)
+
+        batch_wait_ms = args.batch_wait_ms if args.batch_wait_ms is not None else 50.0
+
+        out_dir = args.output
+        if out_dir is None:
+            out_dir = "benchmarks/results/vllm"
+
+        print("\n" + "=" * 80)
+        print("  STARTING INFEROPT SCIENTIFIC VLLM BENCHMARK (Step 10)")
+        print("=" * 80)
+        print(f"  Model ID:      {model_id}")
+        req_info = f"{len(scenario.requests)} requests, seed={args.seed}"
+        print(f"  Scenario:      {scenario.scenario_name} ({req_info})")
+        print(f"  Concurrency:   {concurrencies}")
+        print(f"  Batch Sizes:   {batch_sizes}")
+        print(f"  Enforce Eager: {args.enforce_eager}")
+        print(f"  Repetitions:   {repetitions} (Warmup: {warmup_count})")
+        print(f"  Output Dir:    {out_dir}")
+        print("=" * 80 + "\n")
+
+        report = await validator.run_scientific_benchmark(
+            scenario=scenario,
+            concurrency_levels=concurrencies,
+            batch_sizes=batch_sizes,
+            warmup_count=warmup_count,
+            repetitions=repetitions,
+            batch_wait_ms=batch_wait_ms,
+            output_dir=out_dir,
+        )
+
+        print()
+        print(format_vllm_full_report(report))
+        print(f"\nSaved structured vLLM benchmark JSON report to: {out_dir}")
+        return 0 if report.integrity.is_valid else 1
+
+    # Step 8.5: Controlled MLX Validation / Scientific Audit Mode
+    if args.validate_mlx:
+        from inferopt.backends.mlx import DEFAULT_MODEL_ID as DEFAULT_MLX_MODEL_ID
+        from inferopt.benchmarks.mlx_validation import (
+            MLXValidator,
+            format_audit_full_report,
+            format_comparison_table,
+            format_matrix_table,
+        )
+
+        mlx_model_id = args.model if args.model is not None else DEFAULT_MLX_MODEL_ID
+        validator_mlx = MLXValidator(model_id=mlx_model_id)
+
+        # Audit Mode: 6-Condition Scientific Matrix across Concurrency & Batch Sizes
+        if args.audit:
+            scenario_name = args.scenario if args.scenario != "light" else "concurrent_4"
+            scenario_factory = PRESET_SCENARIOS.get(scenario_name, PRESET_SCENARIOS["concurrent_4"])
+            scenario = scenario_factory(args.seed)
+
+            # Apply request count override if specified
+            if args.num_requests is not None and args.num_requests > 0:
+                cfg_dict = scenario.config.model_dump()
+                cfg_dict["num_requests"] = args.num_requests
+                scenario = generate_workload(WorkloadConfig.model_validate(cfg_dict))
+
+            warmup_count = args.warmup if args.warmup is not None else 2
+            repetitions = args.repetitions if args.repetitions is not None else 5
+
+            if args.concurrency is not None:
+                if isinstance(args.concurrency, list):
+                    concurrencies = tuple(args.concurrency)
+                else:
+                    concurrencies = (args.concurrency,)
+            else:
+                concurrencies = (1, 4, 8)
+
+            if args.batch_sizes is not None:
+                batch_sizes = tuple(args.batch_sizes)
+            elif args.max_batch_size is not None:
+                batch_sizes = (args.max_batch_size,)
+            else:
+                batch_sizes = (1, 2, 4, 8)
+
+            out_path = args.output
+            if out_path is None:
+                out_path = f"benchmarks/results/mlx_audit/{scenario.scenario_name}.json"
+
+            print("\n" + "=" * 80)
+            print("  STARTING INFEROPT SCIENTIFIC MLX AUDIT (Step 8.5)")
+            print("=" * 80)
+            print(f"  Model ID:      {mlx_model_id}")
+            req_info = f"{len(scenario.requests)} requests, seed={args.seed}"
+            print(f"  Scenario:      {scenario.scenario_name} ({req_info})")
+            print(f"  Concurrency:   {concurrencies}")
+            print(f"  Batch Sizes:   {batch_sizes}")
+            print(f"  Repetitions:   {repetitions} (Warmup: {warmup_count})")
+            print(f"  Output JSON:   {out_path}")
+            print("=" * 80 + "\n")
+
+            report_audit = await validator_mlx.run_audit_experiment(
+                scenario=scenario,
+                concurrencies=concurrencies,
+                batch_sizes=batch_sizes,
+                warmup_count=warmup_count,
+                repetitions=repetitions,
+                output_path=out_path,
+            )
+
+            print()
+            print(format_audit_full_report(report_audit))
+            print(f"\nSaved structured audit JSON report to: {out_path}")
+            return 0 if report_audit.integrity.is_valid else 1
+
+        if args.batch_matrix:
+            warmup_count = args.warmup if args.warmup is not None else 1
+            if args.concurrency is not None:
+                if isinstance(args.concurrency, list):
+                    concurrencies = tuple(args.concurrency)
+                else:
+                    concurrencies = (args.concurrency,)
+            else:
+                concurrencies = (4, 8, 16)
+            batch_sizes = tuple(args.batch_sizes) if args.batch_sizes is not None else (1, 2, 4, 8)
+
+            print("\nExecuting InferOpt MLX Batching Experiment Matrix...")
+            matrix_report = await validator_mlx.run_batch_matrix(
+                concurrencies=concurrencies,
+                batch_sizes=batch_sizes,
+                warmup_count=warmup_count,
+                output_path=args.output,
+            )
+            print()
+            print(format_matrix_table(matrix_report))
+            if args.output:
+                print(f"\nSaved batch matrix results to: {args.output}")
+            return 0
+
+        # Legacy 2-way validation mode
+        val_factory = PRESET_SCENARIOS.get(args.scenario)
+        if val_factory is None:
+            print(f"Error: Unknown scenario '{args.scenario}'", file=sys.stderr)
+            return 1
+        scenario = val_factory(args.seed)
+
+        warmup_count = args.warmup if args.warmup is not None else 1
+        repetitions = args.repetitions if args.repetitions is not None else 3
+
+        print(f"\nExecuting MLX Validation Experiment on '{scenario.scenario_name}'...")
+        print(f"Model: {mlx_model_id} | Repetitions: {repetitions} | Warmup: {warmup_count}")
+
+        default_sched = SchedulerConfig()
+        max_batch_size = (
+            args.max_batch_size
+            if args.max_batch_size is not None
+            else default_sched.batch_config.max_batch_size
+        )
+        batch_wait_ms = (
+            args.batch_wait_ms
+            if args.batch_wait_ms is not None
+            else default_sched.batch_config.batch_wait_ms
+        )
+        if args.concurrency is not None:
+            max_concurrency = (
+                args.concurrency[0] if isinstance(args.concurrency, list) else args.concurrency
+            )
+        else:
+            max_concurrency = default_sched.max_concurrency
+
+        sched_config = SchedulerConfig(
+            max_concurrency=max_concurrency,
+            batch_config=BatchConfig(max_batch_size=max_batch_size, batch_wait_ms=batch_wait_ms),
+        )
+
+        out_path = args.output
+        if out_path is None:
+            out_path = f"benchmarks/results/mlx_validation/{scenario.scenario_name}.json"
+
+        report_legacy = await validator_mlx.run_validation_experiment(
+            scenario=scenario,
+            warmup_count=warmup_count,
+            repetitions=repetitions,
+            scheduler_config=sched_config,
+            output_path=out_path,
+        )
+
+        print()
+        print(format_comparison_table(report_legacy))
+        print(f"\nSaved validation report to: {out_path}")
+        return 0 if report_legacy.correctness_gate.is_valid else 1
+
+    main_factory = PRESET_SCENARIOS.get(args.scenario)
+    if main_factory is None:
+        print(f"Error: Unknown scenario '{args.scenario}'", file=sys.stderr)
+        return 1
+
+    scenario = main_factory(args.seed)
+
+    # Apply request count override if specified
+    if args.num_requests is not None and args.num_requests > 0:
+        cfg_dict = scenario.config.model_dump()
+        cfg_dict["num_requests"] = args.num_requests
+        scenario = generate_workload(WorkloadConfig.model_validate(cfg_dict))
+
+    # Build scheduler config overrides
+    default_sched = SchedulerConfig()
+    default_batch = default_sched.batch_config
+
+    max_batch_size = (
+        args.max_batch_size if args.max_batch_size is not None else default_batch.max_batch_size
+    )
+    batch_wait_ms = (
+        args.batch_wait_ms if args.batch_wait_ms is not None else default_batch.batch_wait_ms
+    )
+    if args.concurrency is not None:
+        max_concurrency = (
+            args.concurrency[0] if isinstance(args.concurrency, list) else args.concurrency
+        )
+    else:
+        max_concurrency = default_sched.max_concurrency
+
+    batch_cfg = BatchConfig(max_batch_size=max_batch_size, batch_wait_ms=batch_wait_ms)
+    sched_config = SchedulerConfig(max_concurrency=max_concurrency, batch_config=batch_cfg)
+
+    backend: InferenceBackend
+    if args.backend == "mlx":
+        from inferopt.backends.mlx import DEFAULT_MODEL_ID as DEFAULT_MLX_MODEL_ID
+        from inferopt.backends.mlx import MLXBackend
+
+        backend = MLXBackend(model_id=args.model or DEFAULT_MLX_MODEL_ID)
+    elif args.backend == "vllm":
+        from inferopt.backends.vllm import DEFAULT_VLLM_MODEL_ID, VLLMBackend, VLLMConfig
+
+        backend = VLLMBackend(
+            config=VLLMConfig(
+                model=args.model or DEFAULT_VLLM_MODEL_ID,
+                enforce_eager=args.enforce_eager,
+            )
+        )
+    else:
+        backend = MockBackend(default_latency_sec=0.005)
+
+    runner = BenchmarkRunner()
+
+    if args.verbose:
+        print(f"Executing scenario: {scenario.scenario_name} ({len(scenario.requests)} reqs)...")
+
+    result = await runner.run(
+        scenario=scenario,
+        backend=backend,
+        scheduler_config=sched_config,
+        metadata={"cli": True, "seed": args.seed, "backend": args.backend},
+    )
+
+    separator = "=" * 60
+    sub_sep = "-" * 60
+
+    print()
+    print(separator)
+    print(f"  InferOpt Benchmark Results: {result.scenario_name.upper()}")
+    print(separator)
+    req_summary = f"  Requests:       {result.completed_requests}/{result.total_requests} completed"
+    if result.failed_requests > 0:
+        req_summary += f" ({result.failed_requests} failed)"
+    print(req_summary)
+    print(f"  Duration:       {result.duration_sec:.3f} s")
+    tput_str = (
+        f"  Throughput:     {result.requests_per_sec:.2f} req/s | "
+        f"{result.batches_per_sec:.2f} batch/s | "
+        f"{result.tokens_per_sec:.1f} tokens/s"
+    )
+    print(tput_str)
+    print(sub_sep)
+    print(f"  Latency (avg):  {result.avg_latency_ms:.2f} ms")
+    print(f"  Latency (p50):  {result.p50_latency_ms:.2f} ms")
+    print(f"  Latency (p95):  {result.p95_latency_ms:.2f} ms")
+    print(f"  Latency (p99):  {result.p99_latency_ms:.2f} ms")
+    print(f"  Queue Wait:     {result.avg_queue_wait_ms:.2f} ms")
+    print(f"  Execution:      {result.avg_execution_ms:.2f} ms")
+    print(sub_sep)
+    batch_str = (
+        f"  Total Batches:  {result.total_batches} "
+        f"(avg size {result.avg_batch_size:.2f}, max {result.max_batch_size})"
+    )
+    print(batch_str)
+    print(f"  Peak Queue:     {result.peak_queue_depth} requests")
+    print(f"  Peak Active:    {result.peak_active_requests} requests")
+    print(separator)
+    print()
+
+    if args.output:
+        result.save_json(args.output)
+        if args.verbose:
+            print(f"Saved benchmark result to: {args.output}")
+
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Main entrypoint for CLI execution."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return asyncio.run(run_benchmark_cli(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
