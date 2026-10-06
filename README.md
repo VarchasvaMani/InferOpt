@@ -522,7 +522,7 @@ InferOpt is packaged with optional extras for different hardware environments:
 
 ```bash
 # Clone repository
-git clone https://github.com/suyash639/InferOpt.git
+git clone https://github.com/VarchasvaMani/InferOpt.git
 cd InferOpt
 
 # Option A: Core installation (Mock backend, CPU CI, local unit tests)
